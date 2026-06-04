@@ -1,4 +1,4 @@
-//! Guess 2/3 of the Average — Solana program (Pinocchio 0.10.x)
+//! Guess 2/3 of the Average — Solana program (Pinocchio 0.9.x)
 //!
 //! Game: 10 players each submit a guess [0, 1_000_000]. The player whose guess
 //! is closest to 2/3 of the average of all guesses wins the round pot.
@@ -9,19 +9,20 @@
 extern crate alloc;
 
 use pinocchio::{
-    address::find_program_address,
-    cpi::{Seed, Signer},
+    account_info::AccountInfo,
     entrypoint,
-    error::ProgramError,
+    instruction::{Seed, Signer},
+    program_error::ProgramError,
+    pubkey::{find_program_address, Pubkey},
     sysvars::{rent::Rent, Sysvar},
-    AccountView, Address, ProgramResult,
+    ProgramResult,
 };
+use pinocchio_log::log;
 use pinocchio_system::instructions::{CreateAccount, Transfer};
 
 // ── Program ID ──────────────────────────────────────────────────────────────
 
-#[cfg(feature = "declare-id")]
-pinocchio_pubkey::declare_id!("Guess23AvgGame1111111111111111111111111111111");
+pinocchio_pubkey::declare_id!("7i2qnKgvDfntADBZUCEuT1az3yckUM4zqkQH646QgWxv");
 
 // ── Constants ───────────────────────────────────────────────────────────────
 
@@ -70,6 +71,7 @@ const SUB_SIZE: usize = 40; // 32 + 8
 const GAME_STATE_SIZE: usize = GS_SUBS_START + MAX_PLAYERS * SUB_SIZE; // 46 + 400 = 446
 
 const PHASE_SUBMITTING: u8 = 0;
+#[allow(dead_code)] // Reserved for post-submit "sealed, awaiting resolve" phase
 const PHASE_RESOLVED: u8 = 1;
 const PHASE_FINISHED: u8 = 2;
 
@@ -92,8 +94,8 @@ const PLAYER_ACCOUNT_SIZE: usize = 50;
 entrypoint!(process_instruction);
 
 fn process_instruction(
-    program_id: &Address,
-    accounts: &[AccountView],
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
     instruction_data: &[u8],
 ) -> ProgramResult {
     let (ix, data) = instruction_data
@@ -113,9 +115,7 @@ fn process_instruction(
 
 #[inline]
 fn read_u64(data: &[u8], off: usize) -> u64 {
-    let bytes: [u8; 8] = data[off..off + 8]
-        .try_into()
-        .expect("slice len");
+    let bytes: [u8; 8] = data[off..off + 8].try_into().expect("slice len");
     u64::from_le_bytes(bytes)
 }
 
@@ -129,34 +129,34 @@ fn read_pubkey(data: &[u8], off: usize) -> &[u8] {
     &data[off..off + 32]
 }
 
-fn assert_signer(account: &AccountView) -> ProgramResult {
+fn assert_signer(account: &AccountInfo) -> ProgramResult {
     if !account.is_signer() {
         return Err(ProgramError::MissingRequiredSignature);
     }
     Ok(())
 }
 
-fn assert_writable(account: &AccountView) -> ProgramResult {
+fn assert_writable(account: &AccountInfo) -> ProgramResult {
     if !account.is_writable() {
         return Err(ProgramError::InvalidAccountData);
     }
     Ok(())
 }
 
-fn assert_owned_by(account: &AccountView, owner: &Address) -> ProgramResult {
-    if !account.owned_by(owner) {
+fn assert_owned_by(account: &AccountInfo, owner: &Pubkey) -> ProgramResult {
+    if !account.is_owned_by(owner) {
         return Err(ProgramError::IllegalOwner);
     }
     Ok(())
 }
 
 fn assert_pda(
-    account: &AccountView,
+    account: &AccountInfo,
     seeds: &[&[u8]],
-    program_id: &Address,
+    program_id: &Pubkey,
 ) -> Result<u8, ProgramError> {
     let (expected, bump) = find_program_address(seeds, program_id);
-    if account.address() != &expected {
+    if account.key() != &expected {
         return Err(ProgramError::InvalidSeeds);
     }
     Ok(bump)
@@ -166,8 +166,8 @@ fn assert_pda(
 // Accounts: [authority (signer, writable), game_state (writable), vault (writable), system_program]
 
 fn init_game(
-    program_id: &Address,
-    accounts: &[AccountView],
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
     _data: &[u8],
 ) -> ProgramResult {
     let [authority, game_state, vault, _system_program, ..] = accounts else {
@@ -182,12 +182,12 @@ fn init_game(
     // Derive PDAs
     let game_bump = assert_pda(
         game_state,
-        &[GAME_SEED, authority.address().as_ref()],
+        &[GAME_SEED, authority.key().as_ref()],
         program_id,
     )?;
     let vault_bump = assert_pda(
         vault,
-        &[VAULT_SEED, authority.address().as_ref()],
+        &[VAULT_SEED, authority.key().as_ref()],
         program_id,
     )?;
 
@@ -195,7 +195,7 @@ fn init_game(
     let game_bump_bytes = [game_bump];
     let game_signer_seeds = [
         Seed::from(GAME_SEED),
-        Seed::from(authority.address().as_ref()),
+        Seed::from(authority.key().as_ref()),
         Seed::from(&game_bump_bytes[..]),
     ];
     let game_signer = Signer::from(&game_signer_seeds[..]);
@@ -216,7 +216,7 @@ fn init_game(
     let vault_bump_bytes = [vault_bump];
     let vault_signer_seeds = [
         Seed::from(VAULT_SEED),
-        Seed::from(authority.address().as_ref()),
+        Seed::from(authority.key().as_ref()),
         Seed::from(&vault_bump_bytes[..]),
     ];
     let vault_signer = Signer::from(&vault_signer_seeds[..]);
@@ -233,16 +233,23 @@ fn init_game(
     .invoke_signed(&[vault_signer])?;
 
     // Initialize game state
-    let mut gs = game_state.try_borrow_mut()?;
+    let mut gs = game_state.try_borrow_mut_data()?;
     gs[GS_INITIALIZED] = 1;
-    gs[GS_AUTHORITY..GS_AUTHORITY + 32]
-        .copy_from_slice(authority.address().as_ref());
+    gs[GS_AUTHORITY..GS_AUTHORITY + 32].copy_from_slice(authority.key().as_ref());
     gs[GS_ROUND] = 1;
     gs[GS_PHASE] = PHASE_SUBMITTING;
     write_u64(&mut gs, GS_POT, 0);
     gs[GS_SUB_COUNT] = 0;
     gs[GS_VAULT_BUMP] = vault_bump;
     gs[GS_GAME_BUMP] = game_bump;
+
+    log!(
+        "init: game_state_size={} entry_fee={} max_players={} max_rounds={}",
+        GAME_STATE_SIZE as u64,
+        ENTRY_FEE,
+        MAX_PLAYERS as u64,
+        MAX_ROUNDS as u64
+    );
 
     Ok(())
 }
@@ -253,8 +260,8 @@ fn init_game(
 // Data: guess (u64, 8 bytes)
 
 fn submit_guess(
-    program_id: &Address,
-    accounts: &[AccountView],
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
     data: &[u8],
 ) -> ProgramResult {
     let [player, player_account, game_state, vault, _system_program, ..] = accounts else {
@@ -278,7 +285,7 @@ fn submit_guess(
 
     // Validate game state
     {
-        let gs = game_state.try_borrow()?;
+        let gs = game_state.try_borrow_data()?;
         if gs[GS_INITIALIZED] != 1 {
             return Err(ProgramError::UninitializedAccount);
         }
@@ -292,34 +299,30 @@ fn submit_guess(
 
     // Read authority from game state for PDA derivation
     let authority_bytes: [u8; 32] = {
-        let gs = game_state.try_borrow()?;
+        let gs = game_state.try_borrow_data()?;
         gs[GS_AUTHORITY..GS_AUTHORITY + 32].try_into().unwrap()
     };
 
     // Verify vault PDA
-    assert_pda(
-        vault,
-        &[VAULT_SEED, &authority_bytes],
-        program_id,
-    )?;
+    assert_pda(vault, &[VAULT_SEED, &authority_bytes], program_id)?;
     assert_owned_by(vault, program_id)?;
 
     // Derive and potentially create player account PDA
     let player_bump = assert_pda(
         player_account,
-        &[PLAYER_SEED, player.address().as_ref()],
+        &[PLAYER_SEED, player.key().as_ref()],
         program_id,
     )?;
 
     // Create player account if not initialized
-    if player_account.data_len() == 0 {
+    if player_account.data_is_empty() {
         let rent = Rent::get()?;
         let pa_lamports = rent.minimum_balance(PLAYER_ACCOUNT_SIZE);
 
         let player_bump_bytes = [player_bump];
         let pa_signer_seeds = [
             Seed::from(PLAYER_SEED),
-            Seed::from(player.address().as_ref()),
+            Seed::from(player.key().as_ref()),
             Seed::from(&player_bump_bytes[..]),
         ];
         let pa_signer = Signer::from(&pa_signer_seeds[..]);
@@ -333,9 +336,9 @@ fn submit_guess(
         }
         .invoke_signed(&[pa_signer])?;
 
-        let mut pa = player_account.try_borrow_mut()?;
+        let mut pa = player_account.try_borrow_mut_data()?;
         pa[PA_INITIALIZED] = 1;
-        pa[PA_PUBKEY..PA_PUBKEY + 32].copy_from_slice(player.address().as_ref());
+        pa[PA_PUBKEY..PA_PUBKEY + 32].copy_from_slice(player.key().as_ref());
         write_u64(&mut pa, PA_GUESS, 0);
         write_u64(&mut pa, PA_SCORE, 0);
         pa[PA_BUMP] = player_bump;
@@ -345,11 +348,11 @@ fn submit_guess(
 
     // Check player hasn't already submitted this round
     {
-        let gs = game_state.try_borrow()?;
+        let gs = game_state.try_borrow_data()?;
         let sub_count = gs[GS_SUB_COUNT] as usize;
         for i in 0..sub_count {
             let off = GS_SUBS_START + i * SUB_SIZE;
-            if read_pubkey(&gs, off) == player.address().as_ref() {
+            if read_pubkey(&gs, off) == player.key().as_ref() {
                 return Err(ProgramError::AccountAlreadyInitialized);
             }
         }
@@ -365,10 +368,10 @@ fn submit_guess(
 
     // Record submission in game state
     {
-        let mut gs = game_state.try_borrow_mut()?;
+        let mut gs = game_state.try_borrow_mut_data()?;
         let sub_count = gs[GS_SUB_COUNT] as usize;
         let off = GS_SUBS_START + sub_count * SUB_SIZE;
-        gs[off..off + 32].copy_from_slice(player.address().as_ref());
+        gs[off..off + 32].copy_from_slice(player.key().as_ref());
         write_u64(&mut gs, off + 32, guess);
         gs[GS_SUB_COUNT] = (sub_count + 1) as u8;
 
@@ -378,9 +381,26 @@ fn submit_guess(
 
     // Update player account
     {
-        let mut pa = player_account.try_borrow_mut()?;
+        let mut pa = player_account.try_borrow_mut_data()?;
         write_u64(&mut pa, PA_GUESS, guess);
     }
+
+    // Best-effort observability for indexers (does not fail the tx).
+    let (cur_round, new_sub_count, new_pot) = {
+        let gs = game_state.try_borrow_data()?;
+        (
+            gs[GS_ROUND] as u64,
+            gs[GS_SUB_COUNT] as u64,
+            read_u64(&gs, GS_POT),
+        )
+    };
+    log!(
+        "submit: round={} sub_count={} pot={} guess={}",
+        cur_round,
+        new_sub_count,
+        new_pot,
+        guess
+    );
 
     Ok(())
 }
@@ -391,8 +411,8 @@ fn submit_guess(
 // + remaining accounts: all player_accounts for score updates (writable)
 
 fn resolve_round(
-    program_id: &Address,
-    accounts: &[AccountView],
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
 ) -> ProgramResult {
     if accounts.len() < 4 {
         return Err(ProgramError::NotEnoughAccountKeys);
@@ -411,26 +431,23 @@ fn resolve_round(
 
     // Validate authority
     {
-        let gs = game_state.try_borrow()?;
+        let gs = game_state.try_borrow_data()?;
         if gs[GS_INITIALIZED] != 1 {
             return Err(ProgramError::UninitializedAccount);
         }
         if gs[GS_PHASE] != PHASE_SUBMITTING {
             return Err(ProgramError::InvalidAccountData);
         }
-        if read_pubkey(&gs, GS_AUTHORITY) != authority.address().as_ref() {
+        if read_pubkey(&gs, GS_AUTHORITY) != authority.key().as_ref() {
             return Err(ProgramError::MissingRequiredSignature);
         }
     }
 
-    let (sub_count, round, authority_bytes, vault_bump) = {
-        let gs = game_state.try_borrow()?;
+    let (sub_count, round) = {
+        let gs = game_state.try_borrow_data()?;
         let sc = gs[GS_SUB_COUNT] as usize;
         let r = gs[GS_ROUND];
-        let mut ab = [0u8; 32];
-        ab.copy_from_slice(&gs[GS_AUTHORITY..GS_AUTHORITY + 32]);
-        let vb = gs[GS_VAULT_BUMP];
-        (sc, r, ab, vb)
+        (sc, r)
     };
 
     if sub_count == 0 {
@@ -442,7 +459,7 @@ fn resolve_round(
     let mut guesses: [(u32, u64); MAX_PLAYERS] = [(0, 0); MAX_PLAYERS]; // (index, guess)
 
     {
-        let gs = game_state.try_borrow()?;
+        let gs = game_state.try_borrow_data()?;
         for i in 0..sub_count {
             let off = GS_SUBS_START + i * SUB_SIZE;
             let g = read_u64(&gs, off + 32);
@@ -467,9 +484,19 @@ fn resolve_round(
         }
     }
 
+    // Emit a structured log event for indexers / explorers before any
+    // mutating state changes. The format is intentionally simple — clients
+    // can grep for "resolve" to follow the round stream.
+    log!("resolve: round={} sub_count={} target={} winner_idx={} winner_guess={}",
+         round as u64,
+         sub_count as u64,
+         target as u64,
+         winner_idx as u64,
+         guesses[winner_idx].1);
+
     // Get winner pubkey from game state submissions
     let winner_pubkey: [u8; 32] = {
-        let gs = game_state.try_borrow()?;
+        let gs = game_state.try_borrow_data()?;
         let off = GS_SUBS_START + winner_idx * SUB_SIZE;
         gs[off..off + 32].try_into().unwrap()
     };
@@ -477,15 +504,15 @@ fn resolve_round(
     // Transfer pot from vault to winner — direct lamport manipulation
     // since vault is program-owned
     let pot = {
-        let gs = game_state.try_borrow()?;
+        let gs = game_state.try_borrow_data()?;
         read_u64(&gs, GS_POT)
     };
 
     // Find winner's player account among remaining accounts
-    let mut winner_pa: Option<&AccountView> = None;
+    let mut winner_pa: Option<&AccountInfo> = None;
     for acc in &accounts[3..] {
         assert_owned_by(acc, program_id)?;
-        let pa = acc.try_borrow()?;
+        let pa = acc.try_borrow_data()?;
         if pa[PA_INITIALIZED] == 1 && read_pubkey(&pa, PA_PUBKEY) == &winner_pubkey {
             winner_pa = Some(acc);
             break;
@@ -496,7 +523,7 @@ fn resolve_round(
 
     // Update winner's score
     {
-        let mut pa = winner_pa.try_borrow_mut()?;
+        let mut pa = winner_pa.try_borrow_mut_data()?;
         let score = read_u64(&pa, PA_SCORE);
         write_u64(&mut pa, PA_SCORE, score + 1);
     }
@@ -517,13 +544,16 @@ fn resolve_round(
     };
 
     if transferable > 0 {
-        vault.set_lamports(vault_lamports - transferable);
-        winner_pa.set_lamports(winner_pa.lamports() + transferable);
+        // SAFETY: Vault and winner_pa are program-owned; we hold the only mutable
+        // references to their lamports at this point in the function. The data
+        // borrows above were dropped before this block.
+        *vault.try_borrow_mut_lamports()? -= transferable;
+        *winner_pa.try_borrow_mut_lamports()? += transferable;
     }
 
     // Update game state for next round or finish
     {
-        let mut gs = game_state.try_borrow_mut()?;
+        let mut gs = game_state.try_borrow_mut_data()?;
         write_u64(&mut gs, GS_POT, 0);
         gs[GS_SUB_COUNT] = 0;
 
@@ -549,8 +579,8 @@ fn resolve_round(
 // Drains excess lamports from player_account PDA back to player wallet.
 
 fn claim_prize(
-    program_id: &Address,
-    accounts: &[AccountView],
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
 ) -> ProgramResult {
     let [player, player_account, ..] = accounts else {
         return Err(ProgramError::NotEnoughAccountKeys);
@@ -564,17 +594,17 @@ fn claim_prize(
     // Verify PDA
     assert_pda(
         player_account,
-        &[PLAYER_SEED, player.address().as_ref()],
+        &[PLAYER_SEED, player.key().as_ref()],
         program_id,
     )?;
 
     // Verify ownership
     {
-        let pa = player_account.try_borrow()?;
+        let pa = player_account.try_borrow_data()?;
         if pa[PA_INITIALIZED] != 1 {
             return Err(ProgramError::UninitializedAccount);
         }
-        if read_pubkey(&pa, PA_PUBKEY) != player.address().as_ref() {
+        if read_pubkey(&pa, PA_PUBKEY) != player.key().as_ref() {
             return Err(ProgramError::MissingRequiredSignature);
         }
     }
@@ -586,8 +616,12 @@ fn claim_prize(
 
     if pa_lamports > min_balance {
         let claimable = pa_lamports - min_balance;
-        player_account.set_lamports(min_balance);
-        player.set_lamports(player.lamports() + claimable);
+        // SAFETY: `player_account` and `player` are distinct accounts. The
+        // player_account PDA's lamports are mutated here and the player's
+        // wallet lamports are mutated to receive the claimable amount.
+        *player_account.try_borrow_mut_lamports()? = min_balance;
+        *player.try_borrow_mut_lamports()? += claimable;
+        log!("claim: payout={}", claimable);
     }
 
     Ok(())

@@ -1,0 +1,17 @@
+# Rust / Cargo build artifacts
+target/
+**/target/
+
+# Cargo.lock is intentionally NOT committed: this workspace is a library /
+# on-chain program, not a deployable binary, so per Cargo's own guidance
+# (https://doc.rust-lang.org/cargo/guide/cargo-toml-vs-cargo-lock.html)
+# the lockfile should remain local. If a downstream consumer needs a
+# reproducible build, generate it with `cargo generate-lockfile`.
+Cargo.lock
+**/Cargo.lock
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+.DS_Store

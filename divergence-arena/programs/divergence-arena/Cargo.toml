@@ -8,7 +8,7 @@ description = "Guess 2/3 of the Average — Pinocchio BPF program"
 crate-type = ["cdylib", "lib"]
 
 [dependencies]
-pinocchio = "0.10"
-pinocchio-log = "0.3"
-pinocchio-pubkey = "0.2"
+pinocchio = "0.9"
+pinocchio-log = { version = "0.3", features = ["macro"] }
+pinocchio-pubkey = "0.3"
 pinocchio-system = "0.4"
